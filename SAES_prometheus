@@ -1,0 +1,321 @@
+#! /usr/bin/env python3
+"""Collects data from a SAES ion pump controller
+and exposes it in a prometheus compatible way"""
+
+# %% IMPORTS
+# - python standard libraries
+import argparse
+import os
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+import socket
+from pathlib import Path
+
+# - for the SAES pump communication
+from bitstring import BitArray
+
+# -- prometheus
+from prometheus_client import start_http_server, Gauge, Enum, Info
+
+# - for configuration management
+import yaml
+
+# %% GLOBAL VARIABLES
+VERSION = "0.1"
+NAME = "SAES prometheus server"
+ROOT = Path(os.path.dirname(__file__))
+GLOBAL_TAGS = None
+CONFIG_FILE_PATH = None
+LOG_FILE_PATH = None
+CONFIG = {}
+METRICS = {}
+NAME_PREFIX = "SAES_ion_pump_"
+
+# %% SAES PAYLOAD DICT
+SAES_PAYLOAD_DICT = {
+    "SERIAL_NUMBER": [48, 80],
+    "IOUT": [80, 112],  # nA
+    "VOUT": [112, 128],  # V
+    "VIN": [128, 144],  # dV
+    "TEMPERATURE": [160, 176],  # Kelvin
+    "ARCING_NUMBER": [176, 192],
+    "LIFE_TIME": [192, 224],  # total working hours
+    "UPTIME": [224, 256],  # second elapsed till last start (pump uptime)
+    # "STATUS": [256, 272],
+    # "SW_STATUS": [272, 280],
+    "CONV_RATE": [1048, 1064],  # A/Torr
+    "ONTIME": [288, 320],  # controller uptime (ms)
+}
+MILLIBAR_PER_TORR = 101325 / 760 / 100
+
+# %% LOGGER
+# setup format
+fmt = "[%(asctime)s] - %(name)s - %(levelname)s - %(message)s"
+# config : default level set to INFO
+logging.basicConfig(format=fmt, datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# %% FUNCTIONS
+
+
+def load_config():
+    global CONFIG_FILE_PATH, CONFIG, GLOBAL_TAGS
+    # logger
+    logger = logging.getLogger(__name__)
+    logger.debug(f"loading config file {CONFIG_FILE_PATH}")
+    # load config
+    with CONFIG_FILE_PATH.open() as file:
+        CONFIG = yaml.safe_load(file)
+    # get global tags
+    GLOBAL_TAGS = CONFIG["global"]["tags"]
+
+
+def setup_prometheus_server():
+    global CONFIG, NAME, VERSION, METRICS
+    # logger
+    logger = logging.getLogger(__name__)
+    logger.debug(f"starting prometheus serveur")
+    # start server
+    port = CONFIG["global"]["http_server_port"]
+    start_http_server(port)
+    # generic info
+    i = Info(
+        name="program_information",
+        documentation="Generic information on data collection program",
+        labelnames=list(GLOBAL_TAGS.keys()),
+    )
+    i.labels(**GLOBAL_TAGS).info({"name": NAME, "version": VERSION})
+    # global config
+    scrap_interval = Gauge(
+        name="scrap_interval",
+        documentation="interval for data scrapping on the data collection side",
+        unit="seconds",
+        labelnames=list(GLOBAL_TAGS.keys()),
+    )
+    scrap_interval.labels(**GLOBAL_TAGS).set(float(CONFIG["global"]["scrap_interval"]))
+    # status
+    status = Enum(
+        name="scrapper_status",
+        documentation="status of the data collection program",
+        labelnames=list(GLOBAL_TAGS.keys()),
+        states=["starting", "running", "error"],
+    )
+    status.labels(**GLOBAL_TAGS).state("starting")
+    METRICS["status"] = status
+
+
+def setup_metrics():
+    global METRICS, CONFIG, GLOBAL_TAGS
+    # labels
+    labels = list(GLOBAL_TAGS.keys()) + ["location", "device", "device_serial_number"]
+    # name prefix
+    prefix = CONFIG["SAES"].get("name_prefix", "")
+    # pressure
+    pressure = Gauge(
+        name=f"{prefix}pressure",
+        documentation="Ion pump pressure, inferred from current",
+        unit="millibar",
+        labelnames=labels,
+    )
+    METRICS["pressure"] = pressure
+
+    # current
+    current = Gauge(
+        name=f"{prefix}current",
+        documentation="Ion pump current",
+        unit="nanoampere",
+        labelnames=labels,
+    )
+    METRICS["current"] = current
+
+    # temperature
+    temperature = Gauge(
+        name=f"{prefix}temperature",
+        documentation="Ion pump temperature",
+        unit="celsius",
+        labelnames=labels,
+    )
+    METRICS["temperature"] = temperature
+
+    # arcing number
+    arcing_number = Gauge(
+        name=f"{prefix}arcing_number",
+        documentation="Ion pump arcing number",
+        labelnames=labels,
+    )
+    METRICS["arcing_number"] = arcing_number
+
+    # up time
+    uptime = Gauge(
+        name=f"{prefix}uptime",
+        documentation="Ion pump uptime",
+        unit="second",
+        labelnames=labels,
+    )
+    METRICS["uptime"] = uptime
+
+    # life time
+    lifetime = Gauge(
+        name=f"{prefix}lifetime",
+        documentation="Ion pump lifetime",
+        unit="hour",
+        labelnames=labels,
+    )
+    METRICS["lifetime"] = lifetime
+
+    # output voltage
+    output_voltage = Gauge(
+        name=f"{prefix}output_voltage",
+        documentation="Ion pump output voltage",
+        unit="volt",
+        labelnames=labels,
+    )
+    METRICS["output_voltage"] = output_voltage
+
+
+def start_monitoring():
+    global CONFIG, METRICS, GLOBAL_TAGS
+    # get logger
+    logger = logging.getLogger(__name__)
+    logger.debug("----------- START MONITORING -------------")
+    # get config
+    scrap_interval = CONFIG["global"]["scrap_interval"]
+    last_measurement = time.time()
+    # start monitoring
+    METRICS["status"].labels(**GLOBAL_TAGS).state("running")
+    while True:
+        # new measurement ?
+        if time.time() - last_measurement > scrap_interval:
+            last_measurement = time.time()
+            t0 = time.time()
+            _measure()
+            t1 = time.time()
+            logger.debug(f"measurement done in {t1-t0}s")
+        time.sleep(scrap_interval / 20)
+
+
+def _measure():
+    global CONFIG, MILLIBAR_PER_TORR, METRICS, GLOBAL_TAGS
+
+    # get SAES DATA
+    result = _get_SAES_data()
+    # if no error > analyze result
+    if result:
+        # update status to running
+        METRICS["status"].labels(**GLOBAL_TAGS).state("running")
+        # read data
+        current_nA = result["IOUT"]
+        pressure_mbar = current_nA * 1e-9 / result["CONV_RATE"] * MILLIBAR_PER_TORR
+        temperature_K = result["TEMPERATURE"]
+        temperature_degC = temperature_K - 273.15
+        arcing_number = result["ARCING_NUMBER"]
+        lifetime_hour = result["LIFE_TIME"]
+        uptime_second = result["UPTIME"]
+        output_voltage_volt = result["VOUT"]
+        # prepare tag
+        tags = {
+            "location": CONFIG["SAES"]["location"],
+            "device": "SAES SIP",
+            "device_serial_number": result["SERIAL_NUMBER"],
+        }
+        tags.update(GLOBAL_TAGS)
+        # update metrics
+        METRICS["current"].labels(**tags).set(current_nA)
+        METRICS["pressure"].labels(**tags).set(pressure_mbar)
+        METRICS["temperature"].labels(**tags).set(temperature_degC)
+        METRICS["arcing_number"].labels(**tags).set(arcing_number)
+        METRICS["uptime"].labels(**tags).set(uptime_second)
+        METRICS["lifetime"].labels(**tags).set(lifetime_hour)
+        METRICS["output_voltage"].labels(**tags).set(output_voltage_volt)
+
+    else:
+        METRICS["status"].labels(**GLOBAL_TAGS).state("error")
+
+
+def _get_SAES_data():
+    global CONFIG, SAES_PAYLOAD_DICT
+    # - get logger
+    logger = logging.getLogger(__name__)
+    result = False
+    try:
+        # - get configuration
+        ip = CONFIG["SAES"]["IP"]
+        port = CONFIG["SAES"]["port"]
+        # - prepare socket and send payload
+        payload = bytes.fromhex("0105")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.1)
+        s.sendto(payload, (ip, port))
+        # - get result
+        data, address = s.recvfrom(302)
+        payload = data[2:]  # /!\ BYTES
+        payload_bits = BitArray(bytes=payload)
+        # - parse result
+        # we'll store all the "raw" results in this dict
+        result = {}
+        for key, bitrange in SAES_PAYLOAD_DICT.items():
+            value = payload_bits[bitrange[0] : bitrange[1]]
+            if key in [
+                "STATUS",
+            ]:
+                result[key] = value
+            else:
+                result[key] = value.int
+
+    except Exception as e:
+        logger.error(e)
+    finally:
+        return result
+
+
+# %% MAIN
+def main():
+    load_config()
+    setup_prometheus_server()
+    setup_metrics()
+    start_monitoring()
+
+
+# %% RUN
+if __name__ == "__main__":
+    # -- get arguments
+    # configure parser
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--config", type=str, help="config file path")
+    parser.add_argument("--debug", action="store_true", help="Start in debug mode")
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        help="file to write logs. If none is given, logs are not written.",
+    )
+    # process config argument
+    args = parser.parse_args()
+    conf_path = args.config
+    if conf_path is not None:
+        CONFIG_FILE_PATH = conf_path
+    else:
+        CONFIG_FILE_PATH = ROOT / "config.yml"
+
+    # -- handle logger
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("debug mode enabled")
+
+    if args.log_file is not None:
+        logger.info(f"logging to {args.log_file}")
+        handler = RotatingFileHandler(
+            args.log_file,  # Log file name
+            maxBytes=100000,  # Maximum size of a log file in bytes before rotation
+            backupCount=3,  # Number of backup files to keep
+        )
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    # -- start
+    logger.info("starting SAES prometheus server")
+    main()

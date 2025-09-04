@@ -1,0 +1,50 @@
+# Python env          #
+#######################
+__venv__
+__pycache__
+
+
+# Compiled source     #
+#######################
+build/
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+!libspinapi.so
+
+# TEST                #
+#######################
+.python-version
+.pytest_cache/
+.idea/
+.coverage
+dist/
+
+# DOC                 #
+#######################
+docs/build/
+*.egg-info/
+docs/*.rst
+!docs/index.rst
+
+# OS generated files #
+######################
+.DS_Store?
+ehthumbs.db
+Icon?
+Thumbs.db
+
+# Editor backup files #
+#######################
+*~
+.vscode/
+
+# Project             #
+#######################
+logs/*.log
+tmp/
+config.yaml
+tests/
