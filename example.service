@@ -1,0 +1,16 @@
+# TO BE COPIED TO /etc/systemd/system/
+[Unit]
+Description=Prometheus metrics server for SAES ion pumps
+
+[Service]
+# Type=simple is implicit
+User=root
+ExecStart=/path/to/python /path/to/SAES_prometheus \
+   --log-file /path/to/logfile \
+   --config /path/to/config/file
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
