@@ -46,5 +46,5 @@ Thumbs.db
 #######################
 logs/*.log
 tmp/
-config.yaml
+config.yml
 tests/
