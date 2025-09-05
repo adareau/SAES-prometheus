@@ -12,9 +12,6 @@ from logging.handlers import RotatingFileHandler
 import socket
 from pathlib import Path
 
-# - for the SAES pump communication
-from bitstring import BitArray
-
 # -- prometheus
 from prometheus_client import start_http_server, Gauge, Enum, Info
 
@@ -249,20 +246,27 @@ def _get_SAES_data():
         s.settimeout(0.1)
         s.sendto(payload, (ip, port))
         # - get result
+        # reply is 302 bytes long
         data, address = s.recvfrom(302)
-        payload = data[2:]  # /!\ BYTES
-        payload_bits = BitArray(bytes=payload)
+        # first two bytes are 'version' and 'command'
+        version = data[0]
+        command = data[1]
+        # payload is 300 byte long
+        payload_bytes = data[2:]  # /!\ BYTES
         # - parse result
         # we'll store all the "raw" results in this dict
         result = {}
         for key, bitrange in SAES_PAYLOAD_DICT.items():
-            value = payload_bits[bitrange[0] : bitrange[1]]
+            # compute start / stop in bytes (not bits !!)
+            start = int(bitrange[0] / 8)
+            stop = int(bitrange[1] / 8)
+            value = payload_bytes[start:stop]
             if key in [
                 "STATUS",
             ]:
                 result[key] = value
             else:
-                result[key] = value.int
+                result[key] = int.from_bytes(value)
 
     except Exception as e:
         logger.error(e)
