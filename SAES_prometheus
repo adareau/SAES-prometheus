@@ -56,6 +56,11 @@ logger = logging.getLogger(__name__)
 
 # %% FUNCTIONS
 
+def file_path(string):
+    if os.path.isfile(string):
+        return Path(string)
+    else:
+        raise FileNotFoundError(string)
 
 def load_config():
     global CONFIG_FILE_PATH, CONFIG, GLOBAL_TAGS
@@ -287,7 +292,7 @@ if __name__ == "__main__":
     # -- get arguments
     # configure parser
     parser = argparse.ArgumentParser()
-    parser.add_argument("-c", "--config", type=str, help="config file path")
+    parser.add_argument("-c", "--config", type=file_path, help="config file path")
     parser.add_argument("--debug", action="store_true", help="Start in debug mode")
     parser.add_argument(
         "--log-file",
@@ -298,7 +303,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     conf_path = args.config
     if conf_path is not None:
-        CONFIG_FILE_PATH = conf_path
+        CONFIG_FILE_PATH = Path(conf_path)
     else:
         CONFIG_FILE_PATH = ROOT / "config.yml"
 
